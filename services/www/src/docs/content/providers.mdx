@@ -193,6 +193,17 @@ on a provider, model, or variant; the most specific value wins. Only enable an e
 providers and gateways reject compressed bodies. OpenAI defaults to `"zstd"` when signed in with ChatGPT and no custom
 `baseURL` is configured; API keys send plain JSON. WebSocket messages are unaffected.
 
+Experimental `"auto"` sends plain JSON until a successful response advertises request compression through
+`Accept-Encoding` ([RFC 7694](https://www.rfc-editor.org/rfc/rfc7694.html)). Subsequent JSON POSTs can use the
+advertised gzip or zstd encoding. Support is cached for five minutes per URL and request headers, including
+credentials, with at most 128 entries per client. Only bodies of at least 1 KiB that become smaller are compressed.
+
+This mode does not send capability probes or replay failed requests. An HTTP 415 clears learned support; an explicit
+advertisement without a supported encoding also clears it. Redirects are not followed in auto mode, so support is
+not applied to another endpoint. Signed and already encoded requests pass through unchanged. Response compression
+is independent and keeps its existing behavior. Set `"encoding": "auto"` on the provider, model, or variant to opt in;
+leaving it unset preserves the existing defaults.
+
 ```jsonc title="opencode.jsonc"
 {
   "$schema": "https://opencode.ai/config.json",

@@ -107,7 +107,7 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
       const started = yield* Clock.currentTimeMillis
       // Unlike the header and chunk limits, the whole-request budget has no default.
       const total = request.http?.timeout ? Duration.millis(request.http.timeout) : Duration.infinity
-      const response = yield* runtime.http.execute(prepared.request, prepared.middleware).pipe(
+      const response = yield* runtime.http.execute(prepared.request, prepared.middleware, request.http).pipe(
         Effect.timeoutOrElse({
           duration: Duration.min(timeoutDuration(request.http?.headerTimeout), total),
           orElse: () => timeout("request", "Timed out waiting for response headers"),

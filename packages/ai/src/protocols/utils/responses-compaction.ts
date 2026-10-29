@@ -124,6 +124,7 @@ export const make = (
         encoding: request.http?.encoding,
       }),
       options?.http,
+      request.http,
     )
     const text = yield* RequestExecutor.responseStream(response).pipe(
       Stream.decodeText(),
