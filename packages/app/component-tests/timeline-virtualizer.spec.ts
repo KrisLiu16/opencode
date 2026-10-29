@@ -74,8 +74,8 @@ for (const input of [
     await expect(content.locator("[data-timeline-key]")).toHaveCount(1)
 
     if (input.name === "offset-only") {
-      // Pinned to the end: the 600px row and the virtualizer's 82px tail, less the 180px viewport.
-      await expect(root).toHaveAttribute("data-last-scroll-top", "502")
+      // Pinned to the end: the 600px row and the virtualizer's 86px tail, less the 180px viewport.
+      await expect(root).toHaveAttribute("data-last-scroll-top", "506")
       await root.locator("[data-scrollable]").dispatchEvent("wheel", { deltaY: -1 })
       await expect(root.getByTestId("timeline-controls")).toHaveAttribute("data-pinned", "false")
     }
