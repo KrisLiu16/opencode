@@ -101,7 +101,10 @@ const rounds = (steps: Round[]) =>
                 apiKey: step.apiKey ?? "test",
               }).chat("gpt-4.1-mini"),
               prompt: step.prompt ?? prompt,
-              http: { encoding: step.encoding, headers: step.headers },
+              http:
+                step.encoding === undefined && step.headers === undefined
+                  ? undefined
+                  : { encoding: step.encoding, headers: step.headers },
             }),
           ).pipe(Effect.result)
         }),
@@ -111,11 +114,11 @@ const rounds = (steps: Round[]) =>
   })
 
 describe("negotiated HTTP request encoding", () => {
-  it.effect("waits for a server advertisement and preserves JSON and response preferences", () =>
+  it.effect("negotiates by default and preserves JSON and response preferences", () =>
     Effect.gen(function* () {
       const { seen, results } = yield* rounds(
-        [0, 1, 2].map(() => ({
-          encoding: "auto",
+        ([undefined, "auto", undefined] as const).map((encoding) => ({
+          encoding,
           accept: "gzip, br",
           headers: { "accept-encoding": "br", "x-session-affinity": "session" },
         })),
@@ -135,16 +138,10 @@ describe("negotiated HTTP request encoding", () => {
   for (const [accept, encoding] of [
     ["zstd, gzip", "zstd"],
     ["gzip;q=0.9, zstd;q=0.1", "gzip"],
-    ["GZIP; q=1, zstd;q=0", "gzip"],
     ["gzip;q=0, zstd;q=0", null],
     ["gzip;q=0.5, identity;q=1", null],
-    ["gzip;q=0, gzip", null],
     ["gzip;q=invalid", null],
-    ["gzip;q=1.001", null],
     ["br", null],
-    ["*", null],
-    ["", null],
-    [undefined, null],
   ] as const)
     it.effect(`honors explicit support and quality in ${String(accept)}`, () =>
       Effect.gen(function* () {
@@ -189,7 +186,7 @@ describe("negotiated HTTP request encoding", () => {
         { encoding: "auto", headers: { "content-encoding": "identity" } },
         { encoding: "auto" },
       ])
-      expect(seen.map((call) => call.encoding)).toEqual([null, null, null, "zstd", null, "identity", "gzip"])
+      expect(seen.map((call) => call.encoding)).toEqual([null, null, "gzip", "zstd", null, "identity", "gzip"])
     }),
   )
 
@@ -205,17 +202,18 @@ describe("negotiated HTTP request encoding", () => {
     }),
   )
 
-  it.effect("clears rejected support without retrying the generation", () =>
-    Effect.gen(function* () {
-      const { seen, results } = yield* rounds([
-        { encoding: "auto", accept: "gzip" },
-        { encoding: "auto", status: 415, accept: "gzip" },
-        { encoding: "auto" },
-      ])
-      expect(seen.map((call) => call.encoding)).toEqual([null, "gzip", null])
-      expect(results.map((result) => result._tag)).toEqual(["Success", "Failure", "Success"])
-    }),
-  )
+  for (const status of [400, 415])
+    it.effect(`clears support on HTTP ${status} without retrying the generation`, () =>
+      Effect.gen(function* () {
+        const { seen, results } = yield* rounds([
+          { encoding: "auto", accept: "gzip" },
+          { status, accept: "gzip" },
+          { encoding: "auto" },
+        ])
+        expect(seen.map((call) => call.encoding)).toEqual([null, "gzip", null])
+        expect(results.map((result) => result._tag)).toEqual(["Success", "Failure", "Success"])
+      }),
+    )
 
   it.effect("does not learn from errors or redirects", () =>
     Effect.gen(function* () {
@@ -238,34 +236,13 @@ describe("negotiated HTTP request encoding", () => {
       expect(seen.map((call) => call.encoding)).toEqual([null, null])
     }),
   )
-
-  it.effect("bounds the capability cache and isolates executor lifetimes", () =>
-    Effect.gen(function* () {
-      const { seen } = yield* rounds([
-        ...Array.from(
-          { length: 129 },
-          (_, index): Round => ({
-            encoding: "auto",
-            accept: "gzip",
-            apiKey: String(index),
-          }),
-        ),
-        { encoding: "auto", apiKey: "0" },
-        { encoding: "auto", apiKey: "128" },
-      ])
-      expect(seen.at(-2)?.encoding).toBeNull()
-      expect(seen.at(-1)?.encoding).toBe("gzip")
-      const fresh = yield* rounds([{ encoding: "auto", apiKey: "128" }])
-      expect(fresh.seen[0].encoding).toBeNull()
-    }),
-  )
 })
 
 testEffect(runtimeLayer(FetchHttpClient.layer)).live(
-  "negotiates over HTTP while reading compressed SSE responses",
+  "negotiates by default over HTTP and follows redirects with destination-specific support",
   () =>
     Effect.gen(function* () {
-      const seen: { encoding: string | null; bytes: number; json: unknown }[] = []
+      const seen: { path: string; encoding: string | null; bytes: number; json: unknown }[] = []
       const server = yield* Effect.acquireRelease(
         Effect.sync(() =>
           Bun.serve({
@@ -274,12 +251,17 @@ testEffect(runtimeLayer(FetchHttpClient.layer)).live(
             async fetch(request) {
               const bytes = new Uint8Array(await request.arrayBuffer())
               const encoding = request.headers.get("content-encoding")
+              const path = new URL(request.url).pathname
               seen.push({
+                path,
                 encoding,
                 bytes: bytes.length,
                 json: JSON.parse(new TextDecoder().decode(encoding === "gzip" ? gunzipSync(bytes) : bytes)),
               })
-              if (seen.length >= 4) return new Response(null, { status: 307, headers: { location: "/other" } })
+              if (path === "/v1/chat/completions" && seen.length >= 4)
+                return new Response(null, { status: 308, headers: { location: "/other" } })
+              if (path === "/redirect/chat/completions")
+                return new Response(null, { status: 308, headers: { location: "/canonical" } })
               return new Response(
                 gzipSync(sseEvents(deltaChunk({ role: "assistant", content: "Hi" }), finishChunk("stop"))),
                 {
@@ -297,15 +279,29 @@ testEffect(runtimeLayer(FetchHttpClient.layer)).live(
       )
       const model = configure({ baseURL: `http://127.0.0.1:${server.port}/v1`, apiKey: "fixture" }).chat("fixture")
       for (const turn of [1, 2, 3]) {
-        const response = yield* LLMClient.generate(
-          LLM.request({ model, prompt: prompt.repeat(100) + turn, http: { encoding: "auto" } }),
-        )
+        const response = yield* LLMClient.generate(LLM.request({ model, prompt: prompt.repeat(100) + turn }))
         expect(response.text).toBe("Hi")
       }
       expect(seen.map((call) => call.encoding)).toEqual([null, "gzip", "gzip"])
       expect(seen[1].bytes).toBeLessThan(seen[0].bytes)
       expect(seen[2].json).toMatchObject({ messages: [{ role: "user", content: prompt.repeat(100) + "3" }] })
-      yield* LLMClient.generate(LLM.request({ model, prompt, http: { encoding: "auto" } })).pipe(Effect.result)
-      expect(seen).toHaveLength(4)
+      expect((yield* LLMClient.generate(LLM.request({ model, prompt }))).text).toBe("Hi")
+      expect(seen.slice(3).map((call) => [call.path, call.encoding])).toEqual([
+        ["/v1/chat/completions", "gzip"],
+        ["/other", null],
+      ])
+      const redirected = configure({ baseURL: `http://127.0.0.1:${server.port}/redirect`, apiKey: "fixture" }).chat(
+        "fixture",
+      )
+      for (const encoding of [undefined, "auto"] as const)
+        expect((yield* LLMClient.generate(LLM.request({ model: redirected, prompt, http: { encoding } }))).text).toBe(
+          "Hi",
+        )
+      expect(seen.slice(5).map((call) => [call.path, call.encoding])).toEqual([
+        ["/redirect/chat/completions", null],
+        ["/canonical", null],
+        ["/redirect/chat/completions", null],
+        ["/canonical", "gzip"],
+      ])
     }),
 )

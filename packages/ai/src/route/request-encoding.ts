@@ -1,5 +1,5 @@
 import { Clock, Effect, Option } from "effect"
-import { FetchHttpClient, HttpClientRequest } from "effect/http"
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http"
 import type { RequestEncoding } from "../schema/options.js"
 import type { HttpMiddleware } from "./executor-service.js"
 
@@ -23,7 +23,7 @@ const CAPACITY = 128
 
 export const middleware = (): HttpMiddleware => {
   const cache = new Map<string, { encoding: Encoding; expires: number }>()
-  return (request, next) =>
+  const execute: HttpMiddleware = (request, next) =>
     Effect.gen(function* () {
       if (
         request.method !== "POST" ||
@@ -60,13 +60,10 @@ export const middleware = (): HttpMiddleware => {
             )
           : request
 
-      // A redirect must not transfer learned support or a compressed body to another endpoint.
-      const init = yield* Effect.serviceOption(FetchHttpClient.RequestInit)
-      const response = yield* next(outgoing).pipe(
-        Effect.provideService(FetchHttpClient.RequestInit, { ...Option.getOrUndefined(init), redirect: "manual" }),
-      )
+      const response = yield* next(outgoing)
       const advertised = response.headers["accept-encoding"]
-      if (response.status === 415) cache.delete(key)
+      if (response.status === 415 || (outgoing !== request && response.status >= 400 && response.status < 500))
+        cache.delete(key)
       if (response.status >= 200 && response.status < 300 && advertised !== undefined) {
         const encoding = select(advertised)
         cache.delete(key)
@@ -79,6 +76,20 @@ export const middleware = (): HttpMiddleware => {
         }
       }
       return response
+    })
+  return (request, next) =>
+    Effect.gen(function* () {
+      if (!globalThis.process?.getBuiltinModule?.("node:zlib")) return yield* next(request)
+      const init = Option.getOrUndefined(yield* Effect.serviceOption(FetchHttpClient.RequestInit))
+      if (init?.redirect !== undefined && init.redirect !== "follow") return yield* execute(request, next)
+      // Follow from the original JSON request, so every redirect chooses its own encoding and credentials.
+      const client = HttpClient.makeWith<never, never, Error, never>(
+        Effect.flatMap((input: HttpClientRequest.HttpClientRequest) => execute(input, next)),
+        Effect.succeed,
+      )
+      return yield* HttpClient.followRedirects(client, 20)
+        .execute(request)
+        .pipe(Effect.provideService(FetchHttpClient.RequestInit, { ...init, redirect: "manual" }))
     })
 }
 
